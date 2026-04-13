@@ -2,7 +2,5 @@ fastapi
 uvicorn[standard]
 numpy
 scipy
-soundfile
-pydub
-requests
+librosa
 python-multipart
