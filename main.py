@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import urllib.request, urllib.parse, json, io, os
+import urllib.request, urllib.parse, json, io, os, tempfile
 import numpy as np
 import scipy.signal
 import soundfile as sf
@@ -42,7 +42,7 @@ def load_model():
     MODEL_W = data[wkey].flatten().astype(np.float32)
     MODEL_B = float(data[bkey].flatten()[0])
     assert len(MODEL_W) == 3585, f"Bad weight length: {len(MODEL_W)}"
-    print(f"Model ready — {len(MODEL_W)} features, bias={MODEL_B:.4f}")
+    print(f"Model ready - {len(MODEL_W)} features, bias={MODEL_B:.4f}")
 
 load_model()
 
@@ -53,60 +53,51 @@ N_FEATURES = 3585
 HULL_AREA  = 10
 
 def decode_audio(audio_bytes: bytes) -> np.ndarray:
-    """Decode any audio format to float32 mono @ TARGET_SR."""
-    buf = io.BytesIO(audio_bytes)
-
-    # Try soundfile first (handles WAV, FLAC, OGG)
+    """Write bytes to temp file, decode to float32 mono at TARGET_SR."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
     try:
-        samples, sr = sf.read(buf, dtype="float32", always_2d=False)
-        if samples.ndim == 2:
-            samples = samples.mean(axis=1)
+        # soundfile handles WAV/FLAC/OGG natively
+        try:
+            samples, sr = sf.read(tmp_path, dtype="float32", always_2d=False)
+            if samples.ndim == 2:
+                samples = samples.mean(axis=1)
+            if sr != TARGET_SR:
+                samples = scipy.signal.resample_poly(samples, TARGET_SR, sr).astype(np.float32)
+            return samples
+        except Exception:
+            pass
+
+        # audioread handles MP3 via ffmpeg
+        with audioread.audio_open(tmp_path) as f:
+            sr = f.samplerate
+            n_ch = f.channels
+            raw = b"".join(block for block in f)
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if n_ch > 1:
+            samples = samples.reshape(-1, n_ch).mean(axis=1)
         if sr != TARGET_SR:
-            samples = scipy.signal.resample_poly(
-                samples, TARGET_SR, sr).astype(np.float32)
+            samples = scipy.signal.resample_poly(samples, TARGET_SR, sr).astype(np.float32)
         return samples
-    except Exception:
-        pass
-
-    # Fallback: audioread (handles MP3 via ffmpeg/gstreamer/avconv)
-    buf.seek(0)
-    with audioread.audio_open(buf) as f:
-        sr = f.samplerate
-        n_channels = f.channels
-        raw_blocks = []
-        for block in f:
-            raw_blocks.append(block)
-        raw = b"".join(raw_blocks)
-
-    # audioread gives 16-bit PCM
-    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    if n_channels > 1:
-        samples = samples.reshape(-1, n_channels).mean(axis=1)
-    if sr != TARGET_SR:
-        samples = scipy.signal.resample_poly(
-            samples, TARGET_SR, sr).astype(np.float32)
-    return samples
+    finally:
+        os.unlink(tmp_path)
 
 # ── FAKEPRINT EXTRACTION ──────────────────────────────────────────────────────
 def extract_fakeprint(audio_bytes: bytes) -> np.ndarray:
     samples = decode_audio(audio_bytes)
-
     n_frames = len(samples) // FFT_SIZE
     if n_frames < 1:
-        raise ValueError("Audio clip too short for analysis")
-
+        raise ValueError("Audio clip too short")
     win = np.hanning(FFT_SIZE).astype(np.float64)
     avg_mag = np.zeros(FFT_SIZE // 2 + 1, dtype=np.float64)
-
     for f in range(n_frames):
-        frame = samples[f * FFT_SIZE:(f + 1) * FFT_SIZE].astype(np.float64) * win
+        frame = samples[f * FFT_SIZE:(f+1) * FFT_SIZE].astype(np.float64) * win
         avg_mag += np.abs(np.fft.rfft(frame, n=FFT_SIZE))
     avg_mag /= n_frames
-
     bin_lo = round(1000 * FFT_SIZE / TARGET_SR)
     bin_hi = round(8000 * FFT_SIZE / TARGET_SR)
     slc = avg_mag[bin_lo:bin_hi + 1]
-
     fp = np.zeros(N_FEATURES, dtype=np.float32)
     for i in range(min(len(slc), N_FEATURES)):
         lo = max(0, i - HULL_AREA)
@@ -121,25 +112,19 @@ def predict(fp: np.ndarray) -> float:
 # ── DEEZER ────────────────────────────────────────────────────────────────────
 DZ = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-def deezer_preview(isrc: str, artist: str, track: str) -> str | None:
-    # Try ISRC first
+def deezer_preview(isrc: str, artist: str, track: str):
     try:
         url = f"https://api.deezer.com/track/isrc:{urllib.parse.quote(isrc)}"
-        with urllib.request.urlopen(
-            urllib.request.Request(url, headers=DZ), timeout=8
-        ) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=8) as r:
             d = json.loads(r.read())
         if d.get("preview"):
             return d["preview"]
     except Exception:
         pass
-    # Fallback: title/artist search
     try:
         q = urllib.parse.quote(f'artist:"{artist}" track:"{track}"')
         url = f"https://api.deezer.com/search?q={q}&limit=1"
-        with urllib.request.urlopen(
-            urllib.request.Request(url, headers=DZ), timeout=8
-        ) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=8) as r:
             d = json.loads(r.read())
         if d.get("data") and d["data"][0].get("preview"):
             return d["data"][0]["preview"]
@@ -155,10 +140,7 @@ class TrackRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model_features": len(MODEL_W) if MODEL_W is not None else 0
-    }
+    return {"status": "ok", "model_features": len(MODEL_W) if MODEL_W is not None else 0}
 
 @app.post("/analyze")
 def analyze(req: TrackRequest):
@@ -166,17 +148,15 @@ def analyze(req: TrackRequest):
     if not preview:
         raise HTTPException(status_code=404, detail="No Deezer preview found")
     try:
-        with urllib.request.urlopen(
-            urllib.request.Request(preview, headers=DZ), timeout=15
-        ) as r:
+        with urllib.request.urlopen(urllib.request.Request(preview, headers=DZ), timeout=15) as r:
             audio = r.read()
-        fp    = extract_fakeprint(audio)
+        fp = extract_fakeprint(audio)
         score = predict(fp)
         return {
-            "verdict":   "ai" if score >= 0.5 else "human",
-            "score":     round(score, 4),
+            "verdict": "ai" if score >= 0.5 else "human",
+            "score": round(score, 4),
             "score_pct": round(score * 100, 1),
-            "preview":   preview,
+            "preview": preview,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
