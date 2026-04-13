@@ -4,6 +4,8 @@ from pydantic import BaseModel
 import urllib.request, urllib.parse, json, io, os
 import numpy as np
 import scipy.signal
+import soundfile as sf
+import audioread
 
 app = FastAPI()
 
@@ -44,25 +46,50 @@ def load_model():
 
 load_model()
 
-# ── AUDIO PREPROCESSING ───────────────────────────────────────────────────────
+# ── AUDIO DECODING ────────────────────────────────────────────────────────────
 TARGET_SR  = 16000
 FFT_SIZE   = 8192
 N_FEATURES = 3585
 HULL_AREA  = 10
 
-def decode_mp3(audio_bytes: bytes) -> tuple[np.ndarray, int]:
-    """Decode MP3 bytes to float32 samples using librosa (ffmpeg backend)."""
-    import librosa
+def decode_audio(audio_bytes: bytes) -> np.ndarray:
+    """Decode any audio format to float32 mono @ TARGET_SR."""
     buf = io.BytesIO(audio_bytes)
-    samples, sr = librosa.load(buf, sr=TARGET_SR, mono=True)
-    return samples, sr
 
-def extract_fakeprint(audio_bytes: bytes) -> np.ndarray:
-    samples, sr = decode_mp3(audio_bytes)
+    # Try soundfile first (handles WAV, FLAC, OGG)
+    try:
+        samples, sr = sf.read(buf, dtype="float32", always_2d=False)
+        if samples.ndim == 2:
+            samples = samples.mean(axis=1)
+        if sr != TARGET_SR:
+            samples = scipy.signal.resample_poly(
+                samples, TARGET_SR, sr).astype(np.float32)
+        return samples
+    except Exception:
+        pass
 
+    # Fallback: audioread (handles MP3 via ffmpeg/gstreamer/avconv)
+    buf.seek(0)
+    with audioread.audio_open(buf) as f:
+        sr = f.samplerate
+        n_channels = f.channels
+        raw_blocks = []
+        for block in f:
+            raw_blocks.append(block)
+        raw = b"".join(raw_blocks)
+
+    # audioread gives 16-bit PCM
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).mean(axis=1)
     if sr != TARGET_SR:
         samples = scipy.signal.resample_poly(
             samples, TARGET_SR, sr).astype(np.float32)
+    return samples
+
+# ── FAKEPRINT EXTRACTION ──────────────────────────────────────────────────────
+def extract_fakeprint(audio_bytes: bytes) -> np.ndarray:
+    samples = decode_audio(audio_bytes)
 
     n_frames = len(samples) // FFT_SIZE
     if n_frames < 1:
