@@ -1,8 +1,3 @@
 fastapi
 uvicorn[standard]
-numpy
-scipy
-librosa
-soundfile
-audioread
 python-multipart
