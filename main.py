@@ -1,118 +1,23 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import urllib.request, urllib.parse, json, io, os, tempfile
-import numpy as np
-import scipy.signal
-import soundfile as sf
-import audioread
+import urllib.request, urllib.parse, json, os, time
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ACR_TOKEN     = os.environ.get("ACR_TOKEN", "")
+ACR_CONTAINER = os.environ.get("ACR_CONTAINER", "30590")
+ACR_REGION    = os.environ.get("ACR_REGION", "eu-west-1")
+DZ            = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-# ── MODEL ─────────────────────────────────────────────────────────────────────
-MODEL_W = None
-MODEL_B = None
-WEIGHTS_URL = "https://huggingface.co/lofcz/ai-music-detector/resolve/main/weights.npz"
+def acr_headers():
+    return {"Authorization": f"Bearer {ACR_TOKEN}", "Accept": "application/json", "Content-Type": "application/json"}
 
-def load_model():
-    global MODEL_W, MODEL_B
-    cache = "weights_cache.npz"
-    if os.path.exists(cache):
-        print("Loading model from cache...")
-        data = np.load(cache)
-    else:
-        print("Downloading model weights from Hugging Face...")
-        req = urllib.request.Request(WEIGHTS_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-        with open(cache, "wb") as f:
-            f.write(raw)
-        print(f"Downloaded {len(raw)/1024:.1f} KB")
-        data = np.load(io.BytesIO(raw))
-    keys = list(data.keys())
-    wkey = next(k for k in keys if "weight" in k.lower())
-    bkey = next(k for k in keys if "bias" in k.lower())
-    MODEL_W = data[wkey].flatten().astype(np.float32)
-    MODEL_B = float(data[bkey].flatten()[0])
-    assert len(MODEL_W) == 3585, f"Bad weight length: {len(MODEL_W)}"
-    print(f"Model ready - {len(MODEL_W)} features, bias={MODEL_B:.4f}")
+def acr_base():
+    return f"https://api-{ACR_REGION}.acrcloud.com/api/fs-containers/{ACR_CONTAINER}"
 
-load_model()
-
-# ── AUDIO DECODING ────────────────────────────────────────────────────────────
-TARGET_SR  = 16000
-FFT_SIZE   = 8192
-N_FEATURES = 3585
-HULL_AREA  = 10
-
-def decode_audio(audio_bytes: bytes) -> np.ndarray:
-    """Write bytes to temp file, decode to float32 mono at TARGET_SR."""
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-    try:
-        # soundfile handles WAV/FLAC/OGG natively
-        try:
-            samples, sr = sf.read(tmp_path, dtype="float32", always_2d=False)
-            if samples.ndim == 2:
-                samples = samples.mean(axis=1)
-            if sr != TARGET_SR:
-                samples = scipy.signal.resample_poly(samples, TARGET_SR, sr).astype(np.float32)
-            return samples
-        except Exception:
-            pass
-
-        # audioread handles MP3 via ffmpeg
-        with audioread.audio_open(tmp_path) as f:
-            sr = f.samplerate
-            n_ch = f.channels
-            raw = b"".join(block for block in f)
-        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if n_ch > 1:
-            samples = samples.reshape(-1, n_ch).mean(axis=1)
-        if sr != TARGET_SR:
-            samples = scipy.signal.resample_poly(samples, TARGET_SR, sr).astype(np.float32)
-        return samples
-    finally:
-        os.unlink(tmp_path)
-
-# ── FAKEPRINT EXTRACTION ──────────────────────────────────────────────────────
-def extract_fakeprint(audio_bytes: bytes) -> np.ndarray:
-    samples = decode_audio(audio_bytes)
-    n_frames = len(samples) // FFT_SIZE
-    if n_frames < 1:
-        raise ValueError("Audio clip too short")
-    win = np.hanning(FFT_SIZE).astype(np.float64)
-    avg_mag = np.zeros(FFT_SIZE // 2 + 1, dtype=np.float64)
-    for f in range(n_frames):
-        frame = samples[f * FFT_SIZE:(f+1) * FFT_SIZE].astype(np.float64) * win
-        avg_mag += np.abs(np.fft.rfft(frame, n=FFT_SIZE))
-    avg_mag /= n_frames
-    bin_lo = round(1000 * FFT_SIZE / TARGET_SR)
-    bin_hi = round(8000 * FFT_SIZE / TARGET_SR)
-    slc = avg_mag[bin_lo:bin_hi + 1]
-    fp = np.zeros(N_FEATURES, dtype=np.float32)
-    for i in range(min(len(slc), N_FEATURES)):
-        lo = max(0, i - HULL_AREA)
-        hi = min(len(slc) - 1, i + HULL_AREA)
-        fp[i] = max(0.0, float(slc[i]) - float(slc[lo:hi+1].min()))
-    return fp
-
-def predict(fp: np.ndarray) -> float:
-    logit = MODEL_B + float(np.dot(fp, MODEL_W))
-    return float(1 / (1 + np.exp(-logit)))
-
-# ── DEEZER ────────────────────────────────────────────────────────────────────
-DZ = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-
-def deezer_preview(isrc: str, artist: str, track: str):
+def deezer_preview(isrc, artist, track):
     try:
         url = f"https://api.deezer.com/track/isrc:{urllib.parse.quote(isrc)}"
         with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=8) as r:
@@ -123,8 +28,7 @@ def deezer_preview(isrc: str, artist: str, track: str):
         pass
     try:
         q = urllib.parse.quote(f'artist:"{artist}" track:"{track}"')
-        url = f"https://api.deezer.com/search?q={q}&limit=1"
-        with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=8) as r:
+        with urllib.request.urlopen(urllib.request.Request(f"https://api.deezer.com/search?q={q}&limit=1", headers=DZ), timeout=8) as r:
             d = json.loads(r.read())
         if d.get("data") and d["data"][0].get("preview"):
             return d["data"][0]["preview"]
@@ -132,7 +36,37 @@ def deezer_preview(isrc: str, artist: str, track: str):
         pass
     return None
 
-# ── ROUTES ────────────────────────────────────────────────────────────────────
+def acr_submit(audio_url, name):
+    payload = json.dumps({"data_type": "audio_url", "uri": audio_url, "name": name}).encode()
+    req = urllib.request.Request(f"{acr_base()}/files", data=payload, headers=acr_headers(), method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        d = json.loads(r.read())
+    file_id = (d.get("data") or d).get("id")
+    if not file_id:
+        raise ValueError(f"No file ID: {d}")
+    return file_id
+
+def acr_poll(file_id, timeout=90):
+    url = f"{acr_base()}/files/{file_id}?with_result=1"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=acr_headers()), timeout=15) as r:
+            d = json.loads(r.read())
+        data = d.get("data", d)
+        state = data.get("state")
+        if state == 1:
+            return data
+        if isinstance(state, int) and state < 0:
+            raise ValueError(f"ACRCloud error state={state}")
+        time.sleep(3)
+    raise TimeoutError("ACRCloud timed out")
+
+def acr_delete(file_id):
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{acr_base()}/files/{file_id}", headers=acr_headers(), method="DELETE"), timeout=10)
+    except Exception:
+        pass
+
 class TrackRequest(BaseModel):
     isrc: str
     artist: str = ""
@@ -140,23 +74,36 @@ class TrackRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_features": len(MODEL_W) if MODEL_W is not None else 0}
+    return {"status": "ok", "acr_configured": bool(ACR_TOKEN), "container": ACR_CONTAINER}
 
 @app.post("/analyze")
 def analyze(req: TrackRequest):
+    if not ACR_TOKEN:
+        raise HTTPException(500, "ACR_TOKEN not set in environment variables")
     preview = deezer_preview(req.isrc, req.artist, req.track)
     if not preview:
-        raise HTTPException(status_code=404, detail="No Deezer preview found")
+        raise HTTPException(404, "No Deezer preview found")
+    file_id = None
     try:
-        with urllib.request.urlopen(urllib.request.Request(preview, headers=DZ), timeout=15) as r:
-            audio = r.read()
-        fp = extract_fakeprint(audio)
-        score = predict(fp)
+        file_id = acr_submit(preview, f"{req.artist} - {req.track}")
+        result  = acr_poll(file_id)
+        ai      = result.get("results", {}).get("ai_detection", [])
+        if not ai:
+            raise HTTPException(422, "No AI detection result — enable AI Music Detection on your ACRCloud container")
+        det = ai[0]
+        prob = float(det.get("ai_probability", 0))
         return {
-            "verdict": "ai" if score >= 0.5 else "human",
-            "score": round(score, 4),
-            "score_pct": round(score * 100, 1),
-            "preview": preview,
+            "verdict":       "ai" if det.get("prediction") == "ai_generated" else "human",
+            "score":         round(prob / 100, 4),
+            "score_pct":     round(prob, 1),
+            "likely_source": det.get("likely_source", ""),
+            "sources":       det.get("source_probabilities", []),
+            "preview":       preview,
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
+    finally:
+        if file_id:
+            acr_delete(file_id)
