@@ -14,11 +14,8 @@ DZ            = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 def acr_base():
     return f"https://api-{ACR_REGION}.acrcloud.com/api/fs-containers/{ACR_CONTAINER}"
 
-def acr_json_headers():
-    return {"Authorization": f"Bearer {ACR_TOKEN}", "Accept": "application/json", "Content-Type": "application/json"}
-
-def acr_multipart_headers(boundary):
-    return {"Authorization": f"Bearer {ACR_TOKEN}", "Accept": "application/json", "Content-Type": f"multipart/form-data; boundary={boundary}"}
+def acr_auth():
+    return {"Authorization": f"Bearer {ACR_TOKEN}", "Accept": "application/json"}
 
 def deezer_preview(isrc, artist, track):
     try:
@@ -40,43 +37,55 @@ def deezer_preview(isrc, artist, track):
     return None
 
 def fetch_audio(url):
-    req = urllib.request.Request(url, headers=DZ)
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=15) as r:
         return r.read()
 
-def acr_submit_binary(audio_bytes, name):
-    """Upload audio bytes directly as multipart form data."""
-    boundary = "ACRBoundary1234567890"
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="audio_file"; filename="preview.mp3"\r\n'
-        f"Content-Type: audio/mpeg\r\n\r\n"
-    ).encode() + audio_bytes + f"\r\n--{boundary}--\r\n".encode()
+def build_multipart(fields, files, boundary):
+    """Build multipart/form-data body.
+    fields: dict of {name: value}
+    files: dict of {name: (filename, content_type, bytes)}
+    """
+    body = b""
+    for name, value in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+    for name, (filename, content_type, data) in files.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n".encode()
+        body += data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return body
 
+def acr_submit(audio_bytes, name):
+    boundary = "----ACRFormBoundary7MA4YWxkTrZu0gW"
+    body = build_multipart(
+        fields={"data_type": "audio", "name": name},
+        files={"audio_file": ("preview.mp3", "audio/mpeg", audio_bytes)},
+        boundary=boundary
+    )
     url = f"{acr_base()}/files"
     print(f"Uploading {len(audio_bytes)} bytes to {url}")
-    req = urllib.request.Request(url, data=body, headers=acr_multipart_headers(boundary), method="POST")
+    headers = {**acr_auth(), "Content-Type": f"multipart/form-data; boundary={boundary}"}
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read()
-            print(f"ACR submit ({r.status}): {raw.decode()}")
+            print(f"ACR submit OK: {raw.decode()[:300]}")
             return json.loads(raw)
     except urllib.error.HTTPError as e:
-        body_err = e.read().decode()
-        print(f"ACR submit error {e.code}: {body_err}")
-        raise ValueError(f"ACRCloud submit failed {e.code}: {body_err}")
+        err = e.read().decode()
+        print(f"ACR submit error {e.code}: {err}")
+        raise ValueError(f"ACRCloud {e.code}: {err}")
 
 def acr_poll(file_id, timeout=90):
     url = f"{acr_base()}/files/{file_id}?with_result=1"
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=acr_json_headers()), timeout=15) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=acr_auth()), timeout=15) as r:
                 d = json.loads(r.read())
         except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            print(f"ACR poll error {e.code}: {body}")
-            raise ValueError(f"ACRCloud poll failed {e.code}: {body}")
+            err = e.read().decode()
+            print(f"ACR poll error {e.code}: {err}")
+            raise ValueError(f"Poll failed {e.code}: {err}")
         data = d.get("data", d)
         state = data.get("state")
         print(f"Poll state={state}")
@@ -84,7 +93,7 @@ def acr_poll(file_id, timeout=90):
             print(f"Result: {json.dumps(data)[:500]}")
             return data
         if isinstance(state, int) and state < 0:
-            raise ValueError(f"ACRCloud processing error state={state}")
+            raise ValueError(f"ACRCloud error state={state}")
         time.sleep(3)
     raise TimeoutError("ACRCloud timed out after 90s")
 
@@ -92,7 +101,7 @@ def acr_delete(file_id):
     try:
         urllib.request.urlopen(urllib.request.Request(
             f"{acr_base()}/files/{file_id}",
-            headers=acr_json_headers(), method="DELETE"), timeout=10)
+            headers=acr_auth(), method="DELETE"), timeout=10)
     except Exception:
         pass
 
@@ -110,30 +119,23 @@ def analyze(req: TrackRequest):
     if not ACR_TOKEN:
         raise HTTPException(500, "ACR_TOKEN not set")
     print(f"\n--- {req.artist} / {req.track} ---")
-
     preview = deezer_preview(req.isrc, req.artist, req.track)
     if not preview:
         raise HTTPException(404, "No Deezer preview found")
-
     file_id = None
     try:
-        # Download audio on our server, then upload to ACRCloud as binary
         audio = fetch_audio(preview)
-        print(f"Downloaded {len(audio)} bytes from Deezer")
-
-        result = acr_submit_binary(audio, f"{req.artist} - {req.track}")
-        file_id = (result.get("data") or result).get("id")
+        print(f"Downloaded {len(audio)} bytes")
+        result = acr_submit(audio, f"{req.artist} - {req.track}")
+        file_id = str((result.get("data") or result).get("id", ""))
         if not file_id:
-            raise ValueError(f"No file ID returned: {result}")
+            raise ValueError(f"No file ID: {result}")
         print(f"File ID: {file_id}")
-
-        data = acr_poll(str(file_id))
+        data = acr_poll(file_id)
         ai = data.get("results", {}).get("ai_detection", [])
         print(f"AI detection: {ai}")
-
         if not ai:
             raise HTTPException(422, "No AI detection result — ensure AI Music Detection is enabled on container 31424")
-
         det = ai[0]
         prob = float(det.get("ai_probability", 0))
         return {
