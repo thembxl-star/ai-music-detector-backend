@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import urllib.request, urllib.parse, json, os, time, traceback
+import requests as req_lib
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -40,52 +41,33 @@ def fetch_audio(url):
     with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=15) as r:
         return r.read()
 
-def build_multipart(fields, files, boundary):
-    """Build multipart/form-data body.
-    fields: dict of {name: value}
-    files: dict of {name: (filename, content_type, bytes)}
-    """
-    body = b""
-    for name, value in fields.items():
-        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
-    for name, (filename, content_type, data) in files.items():
-        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n".encode()
-        body += data + b"\r\n"
-    body += f"--{boundary}--\r\n".encode()
-    return body
-
 def acr_submit(audio_bytes, name):
-    boundary = "----ACRFormBoundary7MA4YWxkTrZu0gW"
-    body = build_multipart(
-        fields={"data_type": "audio", "name": name},
-        files={"audio_file": ("preview.mp3", "audio/mpeg", audio_bytes)},
-        boundary=boundary
-    )
+    """Upload audio file using requests library — exact format from ACRCloud docs."""
     url = f"{acr_base()}/files"
     print(f"Uploading {len(audio_bytes)} bytes to {url}")
-    headers = {**acr_auth(), "Content-Type": f"multipart/form-data; boundary={boundary}"}
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-            print(f"ACR submit OK: {raw.decode()[:300]}")
-            return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        err = e.read().decode()
-        print(f"ACR submit error {e.code}: {err}")
-        raise ValueError(f"ACRCloud {e.code}: {err}")
+    r = req_lib.post(
+        url,
+        headers=acr_auth(),
+        data={"data_type": "audio"},
+        files=[("file", ("preview.mp3", audio_bytes, "application/octet-stream"))]
+    )
+    print(f"ACR submit {r.status_code}: {r.text[:300]}")
+    if not r.ok:
+        raise ValueError(f"ACRCloud {r.status_code}: {r.text}")
+    d = r.json()
+    file_id = (d.get("data") or d).get("id")
+    if not file_id:
+        raise ValueError(f"No file ID in response: {d}")
+    return str(file_id)
 
-def acr_poll(file_id, timeout=90):
+def acr_poll(file_id, timeout=120):
     url = f"{acr_base()}/files/{file_id}?with_result=1"
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=acr_auth()), timeout=15) as r:
-                d = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            err = e.read().decode()
-            print(f"ACR poll error {e.code}: {err}")
-            raise ValueError(f"Poll failed {e.code}: {err}")
+        r = req_lib.get(url, headers=acr_auth())
+        if not r.ok:
+            raise ValueError(f"Poll failed {r.status_code}: {r.text}")
+        d = r.json()
         data = d.get("data", d)
         state = data.get("state")
         print(f"Poll state={state}")
@@ -95,13 +77,11 @@ def acr_poll(file_id, timeout=90):
         if isinstance(state, int) and state < 0:
             raise ValueError(f"ACRCloud error state={state}")
         time.sleep(3)
-    raise TimeoutError("ACRCloud timed out after 90s")
+    raise TimeoutError("ACRCloud timed out after 120s")
 
 def acr_delete(file_id):
     try:
-        urllib.request.urlopen(urllib.request.Request(
-            f"{acr_base()}/files/{file_id}",
-            headers=acr_auth(), method="DELETE"), timeout=10)
+        req_lib.delete(f"{acr_base()}/files/{file_id}", headers=acr_auth(), timeout=10)
     except Exception:
         pass
 
@@ -125,17 +105,14 @@ def analyze(req: TrackRequest):
     file_id = None
     try:
         audio = fetch_audio(preview)
-        print(f"Downloaded {len(audio)} bytes")
-        result = acr_submit(audio, f"{req.artist} - {req.track}")
-        file_id = str((result.get("data") or result).get("id", ""))
-        if not file_id:
-            raise ValueError(f"No file ID: {result}")
+        print(f"Downloaded {len(audio)} bytes from Deezer")
+        file_id = acr_submit(audio, f"{req.artist} - {req.track}")
         print(f"File ID: {file_id}")
         data = acr_poll(file_id)
         ai = data.get("results", {}).get("ai_detection", [])
         print(f"AI detection: {ai}")
         if not ai:
-            raise HTTPException(422, "No AI detection result — ensure AI Music Detection is enabled on container 31424")
+            raise HTTPException(422, "No AI detection result — ensure AI Music Detection is enabled on container")
         det = ai[0]
         prob = float(det.get("ai_probability", 0))
         return {
