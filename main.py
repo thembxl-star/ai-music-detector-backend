@@ -1,22 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import urllib.request, urllib.parse, json, os, time, traceback
+import urllib.request, urllib.parse, json, os
 import requests as req_lib
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-ACR_TOKEN     = os.environ.get("ACR_TOKEN", "")
-ACR_CONTAINER = os.environ.get("ACR_CONTAINER", "31424")
-ACR_REGION    = os.environ.get("ACR_REGION", "eu-west-1")
-DZ            = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-
-def acr_base():
-    return f"https://api-{ACR_REGION}.acrcloud.com/api/fs-containers/{ACR_CONTAINER}"
-
-def acr_auth():
-    return {"Authorization": f"Bearer {ACR_TOKEN}", "Accept": "application/json"}
+SH_KEY    = os.environ.get("SH_API_KEY", "")
+SH_URL    = "https://shlabs.music/api/v1/detect"
+DZ        = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 def deezer_preview(isrc, artist, track):
     try:
@@ -38,67 +31,6 @@ def deezer_preview(isrc, artist, track):
         print(f"Deezer search failed: {e}")
     return None
 
-def fetch_audio(url):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=DZ), timeout=15) as r:
-        return r.read()
-
-def acr_submit(audio_bytes):
-    url = f"{acr_base()}/files"
-    print(f"Uploading {len(audio_bytes)} bytes")
-    r = req_lib.post(
-        url,
-        headers=acr_auth(),
-        data={"data_type": "audio"},
-        files=[("file", ("preview.mp3", audio_bytes, "application/octet-stream"))]
-    )
-    print(f"Submit {r.status_code}: {r.text[:200]}")
-    if not r.ok:
-        raise ValueError(f"Submit failed {r.status_code}: {r.text}")
-    d = r.json()
-    file_id = (d.get("data") or d).get("id")
-    if not file_id:
-        raise ValueError(f"No file ID: {d}")
-    return str(file_id)
-
-def acr_poll(file_id, timeout=120):
-    """Poll the list endpoint filtering by file ID until state=1."""
-    # The ACRCloud API only has a list endpoint, no single-item GET.
-    # We search by file_id and check state.
-    url = f"{acr_base()}/files"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        r = req_lib.get(url, headers=acr_auth(), params={
-            "search": file_id,
-            "with_result": 1,
-            "per_page": 5
-        })
-        if not r.ok:
-            raise ValueError(f"Poll failed {r.status_code}: {r.text}")
-        items = r.json().get("data", [])
-        print(f"Poll: {len(items)} items returned")
-        # Find our specific file by ID
-        match = next((x for x in items if str(x.get("id")) == file_id), None)
-        if match is None:
-            # Not found yet, still processing
-            time.sleep(3)
-            continue
-        state = match.get("state")
-        print(f"state={state} detail={match.get('detail','')}")
-        if state == 1:
-            print(f"Result: {json.dumps(match)[:500]}")
-            return match
-        if isinstance(state, int) and state < 0:
-            raise ValueError(f"ACRCloud error state={state}: {match.get('detail','')}")
-        time.sleep(3)
-    raise TimeoutError(f"Timed out waiting for file {file_id}")
-
-def acr_delete(file_id):
-    try:
-        req_lib.delete(f"{acr_base()}/files/{file_id}", headers=acr_auth(), timeout=10)
-        print(f"Deleted {file_id}")
-    except Exception as e:
-        print(f"Delete failed: {e}")
-
 class TrackRequest(BaseModel):
     isrc: str
     artist: str = ""
@@ -106,43 +38,58 @@ class TrackRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "acr_configured": bool(ACR_TOKEN), "container": ACR_CONTAINER}
+    return {"status": "ok", "engine": "shlabs", "configured": bool(SH_KEY)}
 
 @app.post("/analyze")
 def analyze(req: TrackRequest):
-    if not ACR_TOKEN:
-        raise HTTPException(500, "ACR_TOKEN not set")
-    print(f"\n--- {req.artist} / {req.track} ---")
+    if not SH_KEY:
+        raise HTTPException(500, "SH_API_KEY not set in environment variables")
+
+    print(f"\n--- {req.artist} / {req.track} / {req.isrc} ---")
+
+    # Try ISRC directly first — SHLabs supports it natively
+    payload = {"isrc": req.isrc}
+    headers = {"X-API-Key": SH_KEY, "Content-Type": "application/json"}
+
+    r = req_lib.post(SH_URL, headers=headers, json=payload, timeout=30)
+    print(f"SHLabs (ISRC) {r.status_code}: {r.text[:300]}")
+
+    # If ISRC fails, fall back to Deezer preview URL
+    if not r.ok:
+        print("ISRC lookup failed, falling back to Deezer preview URL")
+        preview = deezer_preview(req.isrc, req.artist, req.track)
+        if not preview:
+            raise HTTPException(404, "No audio source found — ISRC not on Spotify and no Deezer preview available")
+        payload = {"audioUrl": preview}
+        r = req_lib.post(SH_URL, headers=headers, json=payload, timeout=30)
+        print(f"SHLabs (audioUrl) {r.status_code}: {r.text[:300]}")
+
+    if not r.ok:
+        err = r.json() if r.content else {}
+        raise HTTPException(r.status_code, err.get("details") or err.get("error") or f"SHLabs error {r.status_code}")
+
+    d = r.json()
+    result = d.get("result", {})
+    prob = float(result.get("probability_ai_generated", 0))
+    prediction = result.get("prediction", "")  # "Human Made", "Pure AI", "Processed AI"
+    usage = d.get("usage", {})
+
+    print(f"Result: {prediction} {prob}% — {result.get('most_likely_ai_type','')}")
+    print(f"Usage remaining: {usage.get('daily_remaining')} daily / {usage.get('monthly_remaining')} monthly")
+
+    # Deezer preview for playback in UI (best effort)
     preview = deezer_preview(req.isrc, req.artist, req.track)
-    if not preview:
-        raise HTTPException(404, "No Deezer preview found")
-    file_id = None
-    try:
-        audio = fetch_audio(preview)
-        print(f"Downloaded {len(audio)} bytes")
-        file_id = acr_submit(audio)
-        print(f"File ID: {file_id}")
-        data = acr_poll(file_id)
-        ai = data.get("results", {}).get("ai_detection", [])
-        print(f"AI detection: {ai}")
-        if not ai:
-            raise HTTPException(422, "No AI detection result — check AI Music Detection is enabled on container 31424")
-        det = ai[0]
-        prob = float(det.get("ai_probability", 0))
-        return {
-            "verdict":       "ai" if det.get("prediction") == "ai_generated" else "human",
-            "score":         round(prob / 100, 4),
-            "score_pct":     round(prob, 1),
-            "likely_source": det.get("likely_source", ""),
-            "sources":       det.get("source_probabilities", []),
-            "preview":       preview,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR: {e}")
-        traceback.print_exc()
-        raise HTTPException(500, str(e))
-    finally:
-        if file_id:
-            acr_delete(file_id)
+
+    return {
+        "verdict":          "ai" if prediction in ("Pure AI", "Processed AI") else "human",
+        "score":            round(prob / 100, 4),
+        "score_pct":        round(prob, 1),
+        "prediction":       prediction,
+        "confidence":       result.get("confidence_score"),
+        "ai_type":          result.get("most_likely_ai_type", ""),
+        "spectral":         result.get("spectral_probabilities", {}),
+        "temporal":         result.get("temporal_probabilities", {}),
+        "preview":          preview,
+        "daily_remaining":  usage.get("daily_remaining"),
+        "monthly_remaining":usage.get("monthly_remaining"),
+    }
